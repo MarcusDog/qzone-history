@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"strings"
+
 	"github.com/spf13/viper"
 )
 
@@ -53,23 +55,34 @@ func LoadConfig() (*Config, error) {
 		},
 	}
 
-	// 尝试读取外部配置文件
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath("./config")
+	// 使用独立实例，避免全局 Viper 状态在测试或嵌入使用时相互污染。
+	v := viper.New()
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath("./config")
+	v.SetEnvPrefix("QZONE_HISTORY")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	v.SetDefault("database.type", defaultConfig.Database.Type)
+	v.SetDefault("database.host", defaultConfig.Database.Host)
+	v.SetDefault("database.port", defaultConfig.Database.Port)
+	v.SetDefault("database.user", defaultConfig.Database.User)
+	v.SetDefault("database.password", defaultConfig.Database.Password)
+	v.SetDefault("database.dbName", defaultConfig.Database.DBName)
+	v.SetDefault("database.sslMode", defaultConfig.Database.SSLMode)
+	v.SetDefault("qzoneAPI.qrCodeURL", defaultConfig.QzoneAPI.QRCodeURL)
+	v.SetDefault("qzoneAPI.loginURL", defaultConfig.QzoneAPI.LoginURL)
+	v.SetDefault("qzoneAPI.messageURL", defaultConfig.QzoneAPI.MessageURL)
 
-	if err := viper.ReadInConfig(); err != nil {
+	if err := v.ReadInConfig(); err != nil {
 		var configFileNotFoundError viper.ConfigFileNotFoundError
-		if errors.As(err, &configFileNotFoundError) {
-			// 配置文件未找到，使用默认配置
-			return defaultConfig, nil
+		if !errors.As(err, &configFileNotFoundError) {
+			return nil, err
 		}
-		// 其他错误
-		return nil, err
 	}
 
 	// 将读取的配置与默认配置合并
-	if err := viper.Unmarshal(defaultConfig); err != nil {
+	if err := v.Unmarshal(defaultConfig); err != nil {
 		return nil, err
 	}
 

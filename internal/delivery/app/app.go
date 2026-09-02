@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"qzone-history/internal/domain/entity"
 	"qzone-history/internal/domain/usecase"
@@ -43,7 +44,7 @@ func (a *App) Run(ctx context.Context) error {
 	log.Println("开始检查本地登录状态...")
 	user, loggedIn, err := a.authUseCase.CheckLocalLoginStatus(ctx)
 	if err != nil {
-		_ = logError("检查本地登录状态失败", err)
+		return logError("检查本地登录状态失败", err)
 	}
 
 	if !loggedIn {
@@ -62,6 +63,8 @@ func (a *App) Run(ctx context.Context) error {
 
 		log.Println("等待用户扫描二维码...")
 
+		pollTicker := time.NewTicker(2 * time.Second)
+		defer pollTicker.Stop()
 		loginSuccess := false
 		for !loginSuccess {
 			status, res, err := a.authUseCase.CheckQRCodeLoginStatus(ctx, qrsig)
@@ -76,21 +79,27 @@ func (a *App) Run(ctx context.Context) error {
 				if err != nil {
 					return logError("完成登录失败", err)
 				}
-				notifySuccess()             // 通知网页登录成功
-				time.Sleep(2 * time.Second) // 等待网页显示成功信息
+				notifySuccess() // 通知网页登录成功
+				if err := waitForContext(ctx, 2*time.Second); err != nil {
+					return err
+				}
 				loginSuccess = true
 			case entity.LoginStatusWaiting:
 				// log.Println("等待扫描二维码")
 			case entity.LoginStatusScanning:
 				log.Println("二维码认证中")
 			case entity.LoginStatusExpired:
-				return logError("二维码已失效", nil)
+				return fmt.Errorf("二维码已失效，请重新启动程序获取新二维码")
 			default:
 				log.Println("未知二维码状态")
 			}
 
 			if !loginSuccess {
-				time.Sleep(2 * time.Second)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-pollTicker.C:
+				}
 			}
 		}
 	}
@@ -120,6 +129,17 @@ func (a *App) Run(ctx context.Context) error {
 
 	log.Println("应用程序成功完成")
 	return nil
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func logError(message string, err error) error {

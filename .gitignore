@@ -3,7 +3,9 @@
 ######################
 *.env
 app.db
+qzone-history.db
 qrcode.png
+*_export.json
 
 # Binaries for programs and plugins
 *.exe

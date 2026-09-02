@@ -2,9 +2,12 @@ package persistence
 
 import (
 	"context"
+	"errors"
 	"qzone-history/internal/domain/entity"
 	"qzone-history/internal/domain/repository"
 	"qzone-history/pkg/database"
+
+	"gorm.io/gorm"
 )
 
 type userRepository struct {
@@ -42,6 +45,9 @@ func (r *userRepository) GetLastLoginUser(ctx context.Context) (*entity.User, er
 		Where("login_status = ?", entity.LoginStatusSuccess).
 		Order("login_expire_time DESC").
 		First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}

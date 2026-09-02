@@ -8,12 +8,18 @@ import (
 
 // extractStringBetween 提取两个字符串之间的内容
 func extractStringBetween(sourceString, startString, endString string) string {
-	startIndex := strings.Index(sourceString, startString) + len(startString)
-	endIndex := strings.Index(sourceString, endString)
-	if startIndex < 0 || endIndex < 0 || startIndex >= endIndex {
+	startIndex := strings.Index(sourceString, startString)
+	if startIndex < 0 {
 		return ""
 	}
-	return sourceString[startIndex : len(sourceString)-37]
+	startIndex += len(startString)
+
+	relativeEndIndex := strings.Index(sourceString[startIndex:], endString)
+	if relativeEndIndex < 0 {
+		return ""
+	}
+
+	return sourceString[startIndex : startIndex+relativeEndIndex]
 }
 
 // replaceMultipleSpaces 去除多余的空格
@@ -30,13 +36,18 @@ func ProcessOldHTML(message string) string {
 		if err != nil {
 			return hex
 		}
-		return string(rune(byteValue))
+		return string([]byte{byte(byteValue)})
 	})
 
 	startString := "html:'"
 	endString := "',opuin"
 	newText = extractStringBetween(newText, startString, endString)
 	newText = replaceMultipleSpaces(newText)
-	newText = strings.ReplaceAll(newText, "\\", "")
+	newText = strings.NewReplacer(
+		`\/`, `/`,
+		`\"`, `"`,
+		`\'`, `'`,
+		`\\`, `\`,
+	).Replace(newText)
 	return newText
 }

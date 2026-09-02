@@ -3,17 +3,24 @@ package qzone_api
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/schollz/progressbar/v3"
 	"io"
 	"net/http"
+	"net/url"
 	"qzone-history/internal/domain/entity"
 	"qzone-history/internal/infrastructure/config"
 	"qzone-history/pkg/utils"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/schollz/progressbar/v3"
 )
+
+const maxResponseBodySize = 16 << 20 // 16 MiB
+
+var loginStatusCodePattern = regexp.MustCompile(`ptuiCB\(['"](\d+)['"]`)
 
 type QzoneAPIClient interface {
 	// GetLoginQRCode 获取登录二维码
@@ -55,6 +62,9 @@ func (c *qzoneAPIClient) GetLoginQRCode() ([]byte, string, error) {
 		return nil, "", fmt.Errorf("获取二维码失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := requireHTTPSuccess(resp, "获取二维码"); err != nil {
+		return nil, "", err
+	}
 
 	var qrsig string
 	for _, cookie := range resp.Cookies() {
@@ -64,9 +74,12 @@ func (c *qzoneAPIClient) GetLoginQRCode() ([]byte, string, error) {
 		}
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
 		return nil, "", fmt.Errorf("读取二维码数据失败: %w", err)
+	}
+	if qrsig == "" {
+		return nil, "", fmt.Errorf("获取二维码失败: 响应中缺少 qrsig")
 	}
 
 	return body, qrsig, nil
@@ -89,24 +102,33 @@ func (c *qzoneAPIClient) CheckLoginStatus(qrsig string) (entity.LoginStatus, str
 		return entity.LoginStatusWaiting, "", fmt.Errorf("发送登录请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := requireHTTPSuccess(resp, "检查二维码登录状态"); err != nil {
+		return entity.LoginStatusWaiting, "", err
+	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
 		return entity.LoginStatusWaiting, "", fmt.Errorf("读取登录响应失败: %w", err)
 	}
 
 	responseText := string(body)
-	if strings.Contains(responseText, "二维码未失效") {
-		return entity.LoginStatusWaiting, "", nil
-	} else if strings.Contains(responseText, "二维码认证中") {
-		return entity.LoginStatusScanning, "", nil
-	} else if strings.Contains(responseText, "二维码已失效") {
-		return entity.LoginStatusExpired, "", nil
-	} else if strings.Contains(responseText, "登录成功") {
-		return entity.LoginStatusSuccess, responseText, nil
+	matches := loginStatusCodePattern.FindStringSubmatch(responseText)
+	if len(matches) >= 2 {
+		switch matches[1] {
+		case "66":
+			return entity.LoginStatusWaiting, "", nil
+		case "67":
+			return entity.LoginStatusScanning, "", nil
+		case "65", "68":
+			return entity.LoginStatusExpired, "", nil
+		case "0":
+			return entity.LoginStatusSuccess, responseText, nil
+		default:
+			return entity.LoginStatusWaiting, "", fmt.Errorf("无法识别的二维码登录状态码: %s", matches[1])
+		}
 	}
 
-	return entity.LoginStatusWaiting, "", nil
+	return entity.LoginStatusWaiting, "", fmt.Errorf("无法解析二维码登录状态响应")
 }
 
 func (c *qzoneAPIClient) CompleteLogin(responseText string) (map[string]string, error) {
@@ -125,21 +147,25 @@ func (c *qzoneAPIClient) CompleteLogin(responseText string) (map[string]string, 
 	uin := matches[1]
 
 	checkSigURL := fmt.Sprintf("https://ptlogin2.qzone.qq.com/check_sig?pttype=1&uin=%s&service=ptqrlogin&nodirect=0&ptsigx=%s&s_url=https%%3A%%2F%%2Fqzs.qq.com%%2Fqzone%%2Fv5%%2Floginsucc.html%%3Fpara%%3Dizone&f_url=&ptlang=2052&ptredirect=100&aid=549000912&daid=5&j_later=0&low_login_hour=0&regmaster=0&pt_login_type=3&pt_aid=0&pt_aaid=16&pt_light=0&pt_3rd_aid=0",
-		uin, sigx)
+		url.QueryEscape(uin), url.QueryEscape(sigx))
 
 	req, err := http.NewRequest("GET", checkSigURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建 check_sig 请求失败: %w", err)
 	}
 
-	c.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	redirectClient := *c.httpClient
+	redirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := redirectClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("发送 check_sig 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("完成登录失败: HTTP 状态 %s", resp.Status)
+	}
 
 	cookies := make(map[string]string)
 	for _, cookie := range resp.Cookies() {
@@ -148,7 +174,9 @@ func (c *qzoneAPIClient) CompleteLogin(responseText string) (map[string]string, 
 		}
 	}
 
-	c.httpClient.CheckRedirect = nil
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("完成登录失败: 响应中没有登录 Cookie")
+	}
 	return cookies, nil
 }
 
@@ -172,8 +200,11 @@ func (c *qzoneAPIClient) GetUserInfo(cookies map[string]string) (*entity.User, e
 		return nil, fmt.Errorf("发送获取用户信息请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := requireHTTPSuccess(resp, "获取用户信息"); err != nil {
+		return nil, err
+	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应体失败: %w", err)
 	}
@@ -262,14 +293,30 @@ func (c *qzoneAPIClient) GetActivities(cookies map[string]string, offset, count 
 	uin := utils.ExtractUin(cookies)
 	g_tk := utils.GenerateGTK(cookies["p_skey"])
 
-	// 构造请求 URL，使用 offset 和 count 来控制分页
-	url := fmt.Sprintf(
-		"https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds2_html_pav_all?uin=%s&begin_time=0&end_time=0&getappnotification=1&getnotifi=1&has_get_key=0&offset=%d&set=0&count=%d&useutf8=1&outputhtmlfeed=1&scope=1&format=jsonp&g_tk=%s",
-		uin, offset, count, g_tk,
-	)
+	// 构造请求 URL，使用 offset 和 count 来控制分页。
+	requestURL, err := url.Parse(c.config.QzoneAPI.MessageURL)
+	if err != nil {
+		return nil, fmt.Errorf("活动接口 URL 无效: %w", err)
+	}
+	query := requestURL.Query()
+	query.Set("uin", uin)
+	query.Set("begin_time", "0")
+	query.Set("end_time", "0")
+	query.Set("getappnotification", "1")
+	query.Set("getnotifi", "1")
+	query.Set("has_get_key", "0")
+	query.Set("offset", strconv.Itoa(offset))
+	query.Set("set", "0")
+	query.Set("count", strconv.Itoa(count))
+	query.Set("useutf8", "1")
+	query.Set("outputhtmlfeed", "1")
+	query.Set("scope", "1")
+	query.Set("format", "jsonp")
+	query.Set("g_tk", g_tk)
+	requestURL.RawQuery = query.Encode()
 
 	// 创建请求
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", requestURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
@@ -285,9 +332,12 @@ func (c *qzoneAPIClient) GetActivities(cookies map[string]string, offset, count 
 		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := requireHTTPSuccess(resp, "获取活动记录"); err != nil {
+		return nil, err
+	}
 
 	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -370,6 +420,24 @@ func (c *qzoneAPIClient) GetActivities(cookies map[string]string, offset, count 
 	})
 
 	return activities, nil
+}
+
+func requireHTTPSuccess(resp *http.Response, operation string) error {
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	return fmt.Errorf("%s失败: HTTP 状态 %s", operation, resp.Status)
+}
+
+func readResponseBody(resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBodySize {
+		return nil, fmt.Errorf("响应体超过 %d MiB 限制", maxResponseBodySize>>20)
+	}
+	return body, nil
 }
 
 func parseTime(timeStr string) time.Time {

@@ -10,7 +10,10 @@ import (
 	"qzone-history/internal/domain/entity"
 	"qzone-history/internal/domain/repository"
 	"qzone-history/internal/domain/usecase"
+	"regexp"
 )
+
+var qqNumberPattern = regexp.MustCompile(`^[0-9]+$`)
 
 type exportUseCase struct {
 	momentRepo       repository.MomentRepository
@@ -31,16 +34,29 @@ func NewExportUseCase(
 }
 
 func (u *exportUseCase) ExportUserDataToJSON(ctx context.Context, userQQ string) error {
-	// 获取用户数据
-	moments, _ := u.momentRepo.FindByUserQQ(ctx, userQQ, -1, 0)
-	boardMessages, _ := u.boardMessageRepo.FindByUserQQ(ctx, userQQ, -1, 0)
-	friends, _ := u.friendRepo.FindFriendsByUserQQ(ctx, userQQ)
+	if !qqNumberPattern.MatchString(userQQ) {
+		return fmt.Errorf("invalid user QQ: expected digits only")
+	}
+
+	// 获取用户数据。任何一项失败都应中止，避免生成看似成功但不完整的备份。
+	moments, err := u.momentRepo.FindByUserQQ(ctx, userQQ, -1, 0)
+	if err != nil {
+		return fmt.Errorf("failed to load moments: %w", err)
+	}
+	boardMessages, err := u.boardMessageRepo.FindByUserQQ(ctx, userQQ, -1, 0)
+	if err != nil {
+		return fmt.Errorf("failed to load board messages: %w", err)
+	}
+	friends, err := u.friendRepo.FindFriendsByUserQQ(ctx, userQQ)
+	if err != nil {
+		return fmt.Errorf("failed to load friends: %w", err)
+	}
 
 	// 创建导出数据结构
 	exportData := struct {
-		Moments       []entity.Moment
-		BoardMessages []entity.BoardMessage
-		Friends       []entity.Friend
+		Moments       []entity.Moment       `json:"moments"`
+		BoardMessages []entity.BoardMessage `json:"boardMessages"`
+		Friends       []entity.Friend       `json:"friends"`
 	}{
 		Moments:       moments,
 		BoardMessages: boardMessages,
@@ -55,7 +71,7 @@ func (u *exportUseCase) ExportUserDataToJSON(ctx context.Context, userQQ string)
 
 	// 写入文件
 	filename := fmt.Sprintf("%s_export.json", userQQ)
-	err = os.WriteFile(filename, jsonData, 0644)
+	err = os.WriteFile(filename, jsonData, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to write JSON file: %w", err)
 	}

@@ -5,14 +5,19 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 )
@@ -32,7 +37,7 @@ func SaveQRCode(qrData []byte) (string, error) {
 	filename := filepath.Join(dir, "qrcode.png")
 
 	// 写入文件
-	err = os.WriteFile(filename, qrData, 0644)
+	err = os.WriteFile(filename, qrData, 0600)
 	if err != nil {
 		return "", err
 	}
@@ -74,12 +79,13 @@ func OpenInBrowser(qrData []byte) (shutdown func(), notifySuccess func(), err er
 	port := listener.Addr().(*net.TCPAddr).Port
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
 
-	// 登录状态
-	loginSuccess := false
+	// 登录状态可能由轮询协程和 HTTP 处理协程同时访问。
+	var loginSuccess atomic.Bool
 
 	// 解析模板
 	tmpl, err := template.New("login").Parse(loginTemplate)
 	if err != nil {
+		_ = listener.Close()
 		return nil, nil, fmt.Errorf("解析模板失败: %w", err)
 	}
 
@@ -90,6 +96,7 @@ func OpenInBrowser(qrData []byte) (shutdown func(), notifySuccess func(), err er
 		"QRCodeBase64": base64Data,
 	})
 	if err != nil {
+		_ = listener.Close()
 		return nil, nil, fmt.Errorf("渲染模板失败: %w", err)
 	}
 	html := htmlBuf.String()
@@ -97,19 +104,39 @@ func OpenInBrowser(qrData []byte) (shutdown func(), notifySuccess func(), err er
 	// 创建 HTTP 服务器
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(html))
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, html)
+		}
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if loginSuccess {
-			w.Write([]byte(`{"success": true}`))
-		} else {
-			w.Write([]byte(`{"success": false}`))
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		setSecurityHeaders(w)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": loginSuccess.Load()})
 		}
 	})
 
-	server := &http.Server{Handler: mux}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 
 	// 在后台启动服务器
 	go func() {
@@ -124,14 +151,26 @@ func OpenInBrowser(qrData []byte) (shutdown func(), notifySuccess func(), err er
 	}
 
 	// 返回关闭函数和通知成功函数
+	var shutdownOnce sync.Once
 	shutdown = func() {
-		server.Shutdown(context.Background())
+		shutdownOnce.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = server.Shutdown(ctx)
+		})
 	}
 	notifySuccess = func() {
-		loginSuccess = true
+		loginSuccess.Store(true)
 	}
 
 	return shutdown, notifySuccess, nil
+}
+
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 }
 
 // openBrowser 在默认浏览器中打开 URL

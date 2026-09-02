@@ -25,7 +25,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
-	log.Printf("配置加载成功: %+v", cfg)
+	log.Printf("配置加载成功（数据库类型: %s，数据库文件: %s）", cfg.Database.Type, cfg.Database.DBName)
 
 	// 初始化数据库
 	log.Println("初始化数据库...")
@@ -50,11 +50,13 @@ func main() {
 	}
 	defer func() {
 		log.Println("关闭数据库连接...")
-		db.Close()
+		if err := db.Close(); err != nil {
+			log.Printf("关闭数据库连接失败: %v", err)
+		}
 	}()
 
 	if err := database.AutoMigrate(db); err != nil {
-		log.Fatalf("数据库迁移失败: %w", err)
+		log.Fatalf("数据库迁移失败: %v", err)
 	}
 	log.Println("数据库初始化完成")
 
